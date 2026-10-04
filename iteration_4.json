@@ -1,0 +1,111 @@
+{
+  "summary": "Full launch-readiness sweep of HR Copilot AI (V1 recruitment + V2 talent + progress tracking + AI career coach). Backend: added /app/backend/tests/test_v25_learning_coach.py (36 cases: framework clone, employee bulk import, career-path math/ordering, learning generate via Claude Sonnet 5, activity progress tracking, level-up -> readiness recompute, coach chat/plan/plans, org isolation) => 36/36 PASSED. Added /app/backend/tests/test_talent_rbac.py (6 cases) which surfaced a real RBAC gap => 1/6 passed (5 intentional failures documenting the gap). Full regression of the whole existing suite: 143/145 passed; the 2 failures are the public-ingress CORS wildcard and the brute-force lockout being keyed on the ingress pod IP. Frontend: Playwright verified landing, login with seeded admin, dashboard KPIs, all 12 sidebar routes (no page errors, no 4xx/5xx), plus full E2E of the 3 newest pages: Career Path (readiness 70% matches backend math), Learning Recs (AI generate -> 2 recommendation cards -> activity todo/in progress/done cycle -> 100% -> Confirm level up -> Career Path readiness rose 70% -> 86%), AI Career Coach (chat reply + 90-day plan with all sections rendered). Test data cleaned up.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/frameworks, /api/employees, /api/employees/bulk, /api/employee-mappings, /api/development-plans, /api/learning/generate, /api/learning/{id}/activity, /api/learning/{id}/level-up, /api/coach/chat, /api/coach/plan (all of routes_talent.py except /candidates/compare)",
+        "issue": "RBAC GAP (reproduced): a member with role 'viewer' can create frameworks (200), create employees (200) and bulk-import employees (200). Only /candidates/compare uses require_perm(); every other talent route uses bare get_current_user. Recruitment writes correctly 403 for viewer (verified), so this is an inconsistency, not a design choice. Consequence: read-only users can mutate all talent data and can also invoke the paid AI endpoints (/learning/generate, /coach/chat, /coach/plan) -- they only returned 404 in the probe because bogus ids were used, and a viewer can create a real employee first. Add require_perm() guards (e.g. talent.write / talent.read) to routes_talent.py.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/auth/login",
+        "issue": "Brute-force lockout is ineffective through the public URL. routes_auth.login builds the rate-limit key as f\"{request.client.host}:{email}\", but behind the k8s ingress request.client.host is the ingress pod IP, which rotates. Probe: 8 wrong-password attempts to the public URL produced [401 x7, 429] and login_attempts contained two distinct keys ('10.227.0.161:...' and '10.227.37.194:...'), i.e. the effective threshold is 5 x (number of proxy pods) instead of 5. Fix: derive the client IP from the first X-Forwarded-For hop, or key the counter on email alone (with a separate per-IP counter). tests/test_auth.py::test_brute_force_lockout fails on the public URL; test_retest_fixes.py::test_lockout_after_5_failures passes because it targets localhost:8001."
+      },
+      {
+        "endpoint": "CORS (all /api routes via public URL)",
+        "issue": "Response to a credentialed cross-origin POST carries access-control-allow-origin: * together with access-control-allow-credentials: true, which browsers reject. The app itself is correct (localhost:8001 echoes the exact Origin + Vary: Origin, verified) -- the edge proxy rewrites ACAO to '*'. No user-visible impact today because the SPA is same-origin with the API, but any future cross-origin/embedded client will break. Mitigation: set CORS_ORIGINS explicitly in backend/.env instead of relying on allow_origin_regex='.*'. tests/test_auth.py::test_cors_allows_credentials fails on the public URL."
+      },
+      {
+        "endpoint": "DELETE /api/frameworks/{fid}",
+        "issue": "Still no cascade (carried over from iteration 3): employee_mappings, development_plans and learning_recommendations referencing the framework are left orphaned, so a stale learning plan can later 404 on level-up. DELETE /api/employees does cascade mappings but not development_plans / learning_recommendations / growth_plans."
+      },
+      {
+        "endpoint": "POST /api/learning/{id}/level-up",
+        "issue": "new_level is accepted unconditionally, including a value lower than the stored current_level (a silent downgrade) and a value above the framework's required_level. Consider rejecting a decrease from this endpoint since it is presented in the UI as 'Confirm level up'."
+      },
+      {
+        "endpoint": "GET /api/competencies",
+        "issue": "Still returns duplicates when an org creates a custom competency whose name matches one of the 52 globals (globals are id 'g:<name>'). Dedupe by name with org-custom winning."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "Learning.jsx promptLevelUp()",
+        "issue": "Level-up confirmation uses the native browser window.prompt() to collect the 1-5 level. It is unstyled, blocks the JS thread, is not keyboard/a11y friendly and is inconsistent with the shadcn dialog used everywhere else. Replace with a shadcn Dialog + Select. Functionally it works (verified: prompt accepted '5', mapping updated, toast shown, readiness 70% -> 86%).",
+        "selector": "[data-testid=\"lr-levelup-0\"]",
+        "priority": "MEDIUM"
+      },
+      {
+        "component": "Learning.jsx",
+        "issue": "After a successful level-up the on-screen plan/readiness is not refreshed and the level-up CTA stays visible, so the user can re-submit the same confirmation repeatedly. Also the linked Skill Gap / Career Path data is only updated after a manual navigation. Consider re-fetching or disabling the CTA after success.",
+        "selector": "[data-testid=\"lr-levelup-0\"]",
+        "priority": "LOW"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {
+        "screen": "src/App.js line 50",
+        "issues": [
+          "Stray closing fragment: `<Route path=\"career-coach\" element={<CareerCoach />} />} />` -- the trailing `} />` is a literal text child of <Routes>. It renders harmlessly today (no console warning observed) but react-router only tolerates <Route> children and this will break on upgrade. Also `ComingSoon` is imported but never used."
+        ]
+      },
+      {
+        "screen": "Career Path",
+        "issues": [
+          "Seeded employee role 'Backend Engineer' matched no framework role, so no 'Current role' card renders and every framework lands under 'Next steps & lateral moves' -- including a 3% 'Stretch' framework that is not a plausible next step. Consider hiding or collapsing paths below a readiness floor, and showing an explicit 'no current-role framework matched' hint."
+        ]
+      },
+      {
+        "screen": "Competency Mapping / Skill Gap Analyzer / Career Path / Learning / Coach (any page with a native <select>)",
+        "issues": [
+          "Persistent console error 'In HTML, <span> cannot be a child of <option>. This will cause a hydration error.' Caused by the Emergent visual-editor instrumentation wrapping dynamic <option> text, not by app code. Informational; it is the only console error on the whole app."
+        ]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v25_learning_coach.py",
+    "/app/backend/tests/test_talent_rbac.py",
+    "/app/test_reports/pytest/v25.xml",
+    "/app/test_reports/pytest/full_run.xml",
+    "/app/test_reports/pytest/talent_rbac.xml"
+  ],
+  "action_items": [
+    "HIGH: add require_perm() RBAC guards to every write route in routes_talent.py (frameworks, employees, bulk, mappings, dev plans, learning generate/activity/level-up, coach chat/plan). Viewer can currently create frameworks/employees and reach the paid AI endpoints.",
+    "MEDIUM: fix the login rate-limit key to use the X-Forwarded-For client IP (or email-only) so the 5-attempt lockout actually triggers through the ingress.",
+    "MEDIUM: replace window.prompt() in Learning.jsx promptLevelUp with a shadcn Dialog + level Select, and refresh the plan/hide the CTA after a successful level-up.",
+    "LOW: set CORS_ORIGINS explicitly in backend/.env instead of allow_origin_regex='.*'.",
+    "LOW: remove the stray `} />` and the unused ComingSoon import in src/App.js line 50.",
+    "LOW: cascade-delete employee_mappings / development_plans / learning_recommendations / growth_plans when a framework or employee is deleted.",
+    "LOW: dedupe GET /api/competencies by name; reject level downgrades on /learning/{id}/level-up."
+  ],
+  "critical_code_review_comments": [
+    "routes_talent.py is 716 lines and now owns 9 feature areas (competencies, frameworks, employees, mappings, gaps, dev plans, career path, learning+progress, coach, candidate compare). Split into routes_talent_frameworks.py / routes_talent_employees.py / routes_learning.py / routes_coach.py before it grows further.",
+    "routes_talent.py: the readiness formula `100 - sum((gap/5)*weight)/sum(weight)*100` is duplicated verbatim in analyze_gap() and employee_career_path(), and the gap-derivation loop is duplicated a third time in generate_learning(). Extract one `compute_readiness(framework, mapping)` helper -- three copies will drift.",
+    "routes_talent.py update_activity_status(): the $set uses positional string paths built from user input indices (`content.recommendations.{i}.activities.{j}.status`). Bounds are checked first so it is safe, but a concurrent regenerate between the read and the write would silently patch the wrong activity. Consider a version/etag or an arrayFilters-based update.",
+    "DevPlanItemIn.priority and ActivityStatusIn.status / LevelUpIn are validated by hand-rolled set membership inside the handlers instead of typing.Literal, so clients get inconsistent 400 vs 422. Move all enums to Literal for uniform 422 responses.",
+    "routes_talent.py bulk_create_employees() does no de-duplication against existing employees (same email can be imported repeatedly) and no email-format validation -- EmployeeIn.email is a plain Optional[str], not EmailStr.",
+    "ai_service.py generate_learning_recommendations/generate_growth_plan trust the model's shape: _extract_json() result is stored straight into Mongo with no Pydantic validation, so a malformed generation persists a document the UI cannot render. Validate the AI payload against a response model before insert.",
+    "cleanup_test_data.py did not cover any V2 talent collections (frameworks/employees/mappings/plans/learning/growth_plans) so previous iterations left orphans in the demo org; extended in this iteration."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v25_learning_coach.py",
+    "/app/backend/tests/test_talent_rbac.py",
+    "/app/backend/tests/cleanup_test_data.py"
+  ],
+  "success_rate": {
+    "backend": "95% (144/151 assertions-level tests passed: 36/36 new V2.5 suite, 143/145 full regression, 1/6 RBAC probe. All 7 failures are the 3 distinct defects listed above -- RBAC gap, lockout key, ingress CORS -- not flakes.)",
+    "frontend": "100% of flows exercised (login, 12/12 routes render with no page errors and no 4xx/5xx API calls, Career Path readiness math, Learning AI generate + progress cycle + level-up + readiness recompute, Coach chat + 90-day plan). 2 UX defects, 0 blocking."
+  },
+  "seed_data_creation": "Temporarily created framework 'QAUI Senior Backend Engineer' + employee 'QAUI Priya Sharma' + a 3-competency mapping in the demo org to drive the Career Path / Learning / Coach UI, plus ~21 transient TEST_ signup orgs and TEST_ frameworks/employees/plans from pytest. All removed by the extended /app/backend/tests/cleanup_test_data.py (21 orgs, 30 users, 4 frameworks, 3 employees, 1 learning plan, 1 growth plan, login_attempts reset). The pre-existing /api/demo/seed data in the demo org was intentionally left in place.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "Admin ayushchaturvedi205@gmail.com / HrCopilot@2026 -- valid, login 200, bcrypt hash verified $2b$, httpOnly access_token cookie set, cookie-only auth to /api/auth/me works, logout 200.",
+  "context_for_next_testing_agent": "Verified numerically this iteration: framework {Technical Depth req5 w40, System Design req4 w35, Ownership req3 w25} with current 3/2/3 => readiness 70.0%, Ownership priority 'Met', career-path top_gaps ordered [Technical Depth +2, System Design +2]; after level-up Technical Depth -> 5 readiness becomes 86.0% in both /skill-gaps/analyze and the Career Path UI. Learning content activities default to status='todo' + completed_at=null, the PATCH sets completed_at on 'done' and nulls it on 'todo'/'in_progress'. Frontend UI cycle order is todo -> in_progress -> done -> todo, and the 'Confirm level up' CTA only appears at 100% of one recommendation's activities. Playwright gotchas: (1) select options are populated asynchronously, so wait_for_function on options.length > 1 before select_option; (2) Learning level-up opens a native window.prompt -- register page.once('dialog', lambda d: d.accept('5')) BEFORE clicking; (3) inner_text() returns CSS-uppercased label text, so match 'NORTH STAR' not 'North Star'. Sidebar testids: nav-overview, nav-jobs, nav-jd-generator, nav-candidates, nav-resume-analyzer, nav-interview-assistant, nav-competency-mapping, nav-skill-gap-analyzer, nav-career-path, nav-learning-recs, nav-career-coach, nav-organization-&-team. Run cleanup_test_data.py after every run.",
+  "rca_of_the_issue": "1) RBAC gap: routes_talent.py was written with `Depends(get_current_user)` on every endpoint while routes_hr.py uses `Depends(require_perm(...))`; the permission matrix in deps.py was simply never extended with talent scopes, so role has no effect on any talent write. 2) Lockout: the rate-limit key is f\"{request.client.host}:{email}\" and FastAPI/Starlette sets request.client.host from the immediate TCP peer, which behind the k8s ingress is the ingress pod (2+ rotating IPs), multiplying the effective attempt budget. Reproduced: 8 public wrong-password logins -> [401 x7, 429] with two distinct keys stored in login_attempts. 3) CORS: server.py falls back to allow_origin_regex='.*' when CORS_ORIGINS is unset; the app echoes the Origin correctly on localhost:8001 but the preview edge proxy rewrites access-control-allow-origin to '*' while keeping allow-credentials: true."
+}

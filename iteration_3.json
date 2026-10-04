@@ -1,0 +1,47 @@
+{
+  "summary": "V2 Talent Development + Candidate Comparison tested end-to-end. Backend: new pytest suite /app/backend/tests/test_talent_v2.py (33 cases across competencies, frameworks, employees, employee-mappings upsert, skill-gap analyzer, development plans, candidate compare, multi-tenant isolation, auth) => 33/33 PASSED. Frontend: Playwright drove the full ordered flow on the public preview URL (login -> sidebar -> create framework w/ auto-balance -> create employee -> map current/target -> analyze skill gap -> create dev plan -> candidate multi-select compare + job filter). All flows worked. No functional defects found; 3 minor/cosmetic observations reported below. Test data created during the run was cleaned up from MongoDB.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/skill-gaps/analyze", "issue": "An assessed competency with gap=0 (already at/above required level) is still labelled priority 'Low' rather than something neutral like 'None'/'Met'. Cosmetically it reads as an outstanding action item. _priority() returns 'Low' for score 0."},
+      {"endpoint": "POST /api/development-plans", "issue": "employee_id / framework_id are not validated against the org's employees/frameworks (unlike /employee-mappings and /skill-gaps/analyze). A plan can be created with a bogus employee_id and returns 200."},
+      {"endpoint": "POST /api/candidates/compare", "issue": "Duplicate ids in candidate_ids cause a false 404 (len(docs) != len(candidate_ids)) instead of de-duplicating; also the >6 guard runs before dedup. Low impact (UI cannot send duplicates), but the error message is misleading."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {"flow": "Candidates -> Compare", "issue": "No client-side cap at 6 selections. Compare button only disables below 2; with >6 candidates in an org the user can select 7+ and will hit a raw backend 400 toast. Suggest disabling additional checkboxes / capping at 6 with a hint.", "affected_selectors": ["cand-sel-{id}", "cand-compare-btn"]}
+    ],
+    "design_issues": [
+      {"screen": "Dashboard sidebar", "issues": ["'Learning Recommendations' label is truncated to 'Learning Recommendatio…' in the 64px-wide nav (no tooltip/title attribute)."]},
+      {"screen": "Skill Gap Analyzer / Competency Mapping", "issues": ["Preview-only React console warning: 'In HTML, <span> cannot be a child of <option>' — caused by the Emergent visual-editor instrumentation wrapping dynamic option text in <span style=display:contents>, not by app code. Informational only, but it does pollute the console on every render of these two pages."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_talent_v2.py",
+    "/app/test_reports/pytest/talent_v2.xml",
+    "/app/test_reports/pytest/talent_v2_compare.xml"
+  ],
+  "action_items": [
+    "Optional: validate employee_id/framework_id on POST /api/development-plans (404 when not in org).",
+    "Optional: cap candidate comparison selection at 6 in the Candidates UI instead of relying on the backend 400.",
+    "Optional: return a neutral priority (e.g. 'Met') when an assessed competency has gap 0.",
+    "Optional: add title attribute / wider nav for the truncated 'Learning Recommendations' label."
+  ],
+  "critical_code_review_comments": [
+    "routes_talent.py: /employee-mappings upsert sets created_by on every update, overwriting the original author. Use $setOnInsert for created_at/created_by.",
+    "routes_talent.py: DELETE /frameworks/{id} does not cascade-delete employee_mappings / development_plans referencing it (DELETE /employees does cascade mappings). Leaves orphan mapping docs.",
+    "routes_talent.py: only /candidates/compare uses require_perm(); all talent endpoints (frameworks/employees/mappings/plans create+delete) are open to any authenticated org member including viewer/recruiter roles. Consider RBAC perms for talent writes.",
+    "routes_talent.py: DEFAULT_COMPETENCIES global ids are 'g:<name>'; if an org creates a custom competency with the same name as a global, GET /competencies returns duplicates and the framework form lists it twice.",
+    "DevPlanItemIn.priority is a free-form str with no enum validation, while DevPlanIn.status is validated manually in the handler — move both to Literal/enum for consistent 422s."
+  ],
+  "updated_files": ["/app/backend/tests/test_talent_v2.py"],
+  "success_rate": {"backend": "100% (33/33)", "frontend": "100% of V2 flows (framework create + auto-balance + weight validation, employee create, mapping save/upsert, gap analysis w/ correct math and priority ordering, dev plan creation, candidate compare 2-6 + skill matrix + job filter)"},
+  "seed_data_creation": "POST /api/demo/seed run once on the admin org (3 jobs + 4 candidates) so >=6 candidates existed for comparison — intentionally left in place for the demo org. All TEST_/QA_ frameworks, employees, mappings, competencies, development plans and 7 transient TEST_ signup orgs were deleted from MongoDB after the run.",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "Admin ayushchaturvedi205@gmail.com / HrCopilot@2026 — valid, login 200",
+  "context_for_next_testing_agent": "Verified numerically: framework {Technical Depth L5 w34, System Design L4 w33, Ownership L3 w33} with current levels 2/3/1 => readiness 59.8% and priorities Critical/High/Medium sorted correctly; same framework with no mapping => 19.8% and all rows 'Not Assessed' + amber banner + 'No gaps to add to a plan.' toast on Create plan. Backend readiness formula = 100 - sum((gap/5)*weight)/sum(weight)*100. Multi-tenant isolation verified with fresh signup orgs (empty lists + 404 on cross-org GET/DELETE/mapping/compare). Frontend test-id gotcha: SkillGapAnalyzer selects render before /employees and /frameworks resolve, so wait_for_function on option count > 1 before select_option; also label text is CSS-uppercased so match case-insensitively. Run `python /app/backend/tests/cleanup_test_data.py` plus the TEST_/QA_ talent cleanup after suites.",
+  "rca_of_the_issue": "No defects to root-cause. The three initial pytest failures were test-side issues I fixed: (1) the session-scoped `api` fixture inherits the httpOnly access_token cookie from the admin login, so unauthenticated assertions must use a fresh requests call; (2) my expected readiness value was mis-computed. Backend behaviour was correct in both cases."
+}
