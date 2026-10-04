@@ -177,7 +177,7 @@ The application will be available locally through the development server.
 https://github.com/Babydragon203
 
 **Live Demo:**
-Add your deployed HR Copilot AI URL here.
+https://hrcopilotai.com/
 
 ---
 
